@@ -1,0 +1,30 @@
+name = "MagiJl"
+uuid = "d8068848-47f9-48d8-9060-ff7744899dbd"
+authors = ["k1m9l <klhlubek19@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+BandedMatrices = "aae01518-5342-5314-be14-df237901396f"
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+DifferentialEquations = "0c46a032-eb83-5123-abaf-570d42b7fbaa"
+FiniteDifferences = "26cc04aa-876d-5657-8c51-4c34ba976000"
+KernelFunctions = "ec8451be-7e33-11e9-00cf-bbf324bd1392"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+PositiveFactorizations = "85a6dd25-e78a-55b7-8502-1745935b8125"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+TestSetExtensions = "98d24dd4-01ad-11ea-1b02-c9a08f80db04"
+
+[compat]
+BandedMatrices = "1.9.4"
+BenchmarkTools = "1.6.0"
+DifferentialEquations = "7.16.1"
+FiniteDifferences = "0.12.32"
+KernelFunctions = "0.10.65"
+LinearAlgebra = "1.11.0"
+Logging = "1.11.0"
+PositiveFactorizations = "0.2.4"
+Printf = "1.11.0"
+Test = "1.11.0"
+TestSetExtensions = "3.0.0"
