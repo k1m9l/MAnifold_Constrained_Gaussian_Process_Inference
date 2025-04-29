@@ -11,6 +11,10 @@ using LinearAlgebra
 using KernelFunctions
 using BandedMatrices
 using PositiveFactorizations
+using LogDensityProblems # Add if not already present via submodules
+using AdvancedHMC       # Add if not already present via submodules
+
+# ... (rest of the file)
 # using DifferentialEquations # Will be needed for solving
 # using MCMCChains # Or other MCMC packages later
 
@@ -22,6 +26,8 @@ include("ode_models.jl")
 include("kernels.jl")
 include("gaussian_process.jl")
 include("likelihoods.jl")
+include("logdensityproblems_interface.jl") # Add this
+include("samplers.jl")                     # Add this
 # --- Placeholders for future components ---
 # include("banded_utils.jl") # If you create separate utils for BLAS calls etc.
 # include("samplers.jl")
@@ -34,6 +40,9 @@ using .ODEModels
 using .Kernels
 using .GaussianProcess
 using .Likelihoods
+using .Likelihoods
+using .LogDensityProblemsInterface # Add this
+using .Samplers                     # Add this
 # --- Placeholders ---
 # using .BandedUtils
 # using .Samplers
@@ -57,6 +66,9 @@ export GPCov, calculate_gp_covariances!
 
 # From likelihoods.jl
 export log_likelihood_banded
+
+export MagiTarget       # From LogDensityProblemsInterface
+export run_nuts_sampler # From Samplers (or your chosen name)
 
 # --- Placeholders ---
 # export solve_magi # Main user-facing function

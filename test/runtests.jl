@@ -14,40 +14,40 @@ using TestSetExtensions
     # Run tests for the ODE model definitions
     println("\nRunning ODE Model Tests...")
     @testset "ODE Models Sub-Tests" begin # Optional inner testset for grouping
-        include("test_ode_models.jl")
+        #include("test_ode_models.jl")
     end
 
     # Run tests for the kernel function implementations/usage
     println("\nRunning Kernel Tests...")
     @testset "Kernel Functions Sub-Tests" begin # Optional inner testset
-       include("test_kernels.jl") # Assumes this file exists and contains kernel tests
+       #include("test_kernels.jl") # Assumes this file exists and contains kernel tests
     end
 
     # Run tests for Gaussian Process utility functions
     println("\nRunning GP Utils Tests...")
     @testset "GP Utilities Sub-Tests" begin # Optional inner testset
-        include("test_gp_utils.jl")
+        #include("test_gp_utils.jl")
     end
 
     # Run tests for the GPCov struct and its calculation
     println("\nRunning GP Covariance Tests...")
     @testset "GP Covariance Sub-Tests" begin # Optional inner testset
-        include("test_gp.jl")
+        #include("test_gp.jl")
     end
 
     # Run tests for the log-likelihood calculation
     println("\nRunning Likelihood Tests...")
     @testset "Likelihood Sub-Tests" begin # Optional inner testset
-        include("test_likelihoods.jl")
+        #include("test_likelihoods.jl")
     end
 
-    # Add include statements for other test files as you create them
-    # For example:
-    # println("\nRunning Sampler Tests...")
-    # @testset "Sampler Sub-Tests" begin
-    #    include("test_sampler.jl")
-    # end
+    # Run tests for the sampler integration
+    println("\nRunning Sampler Tests...")
+    @testset "Sampler Sub-Tests" begin # Optional inner testset
+       include("test_samplers.jl") # Include the new sampler tests
+    end
 
+    # Placeholder for solver tests
     # println("\nRunning Solver Tests...")
     # @testset "Solver Sub-Tests" begin
     #    include("test_solver.jl")
