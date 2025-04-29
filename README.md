@@ -95,3 +95,4 @@
 3.  **Implement Sampler:** Implement the HMC/NUTS logic (e.g., in `src/samplers.jl`), potentially leveraging packages like `AdvancedHMC.jl` or `DynamicHMC.jl`, using the calculated log-likelihood and gradient.
 4.  **Implement Main Solver:** Create the main `solve_magi` function (`src/solver.jl` or `MagiJl.jl`) to orchestrate the setup, sampling, and result processing.
 5.  **Add Tests:** Create tests for the gradient calculation, sampler, and the main solver.
+# MAGI
