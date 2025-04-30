@@ -2,8 +2,22 @@
 
 module ODEModels
 
+struct OdeSystem
+    fOde::Function
+    fOdeDx::Function
+    fOdeDtheta::Function
+    thetaLowerBound::Vector{Float64}
+    thetaUpperBound::Vector{Float64}
+    thetaSize::Int
+    # Optional: name::String # Add if you want a name field
+end
+
+
+
 # --- Ensure this export line is inside the module ---
+export OdeSystem # <--- ADD THIS TO EXPORTS
 export fn_ode!, hes1_ode!, hes1log_ode!, hes1log_ode_fixg!, hes1log_ode_fixf!, hiv_ode!, ptrans_ode!
+export fn_ode_dx!, fn_ode_dtheta, hes1_ode_dx!, hes1_ode_dtheta # Add other Jacobians as needed
 # -----------------------------------------------------
 
 # Notes on Translation:
