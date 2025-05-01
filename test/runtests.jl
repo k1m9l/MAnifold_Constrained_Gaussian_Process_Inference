@@ -14,7 +14,7 @@ using TestSetExtensions
     println("Running End-to-End Tests...")
     @testset "End-to-End Tests" begin
         # Include the end-to-end test for the solver
-        #include("test_solver.jl")
+        include("test_solver.jl")
     end
 
     # Run tests for the ODE model definitions

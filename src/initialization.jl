@@ -25,15 +25,18 @@ export optimize_gp_hyperparameters
 Calculates the negative log marginal likelihood for a single dimension GP model.
 Assumes y_obs ~ GP(0, K_phi) + N(0, sigma^2*I).
 
-Arguments:
-- log_params: Vector containing [log(variance), log(lengthscale), log(sigma)].
-- y_obs_dim: Vector of observations for the current dimension (NaNs are handled).
-- t_obs: Vector of observation times.
-- kernel_type: String specifying the kernel ("matern52", "rbf", etc.).
-- jitter: Small value added to the diagonal for numerical stability.
+# Arguments
+- `log_params`: Vector containing [log(variance), log(lengthscale), log(sigma)]
+- `y_obs_dim`: Vector of observations for the current dimension
+- `t_obs`: Vector of observation times
+- `kernel_type`: String specifying the kernel type
+- `jitter`: Small value for numerical stability
 
-Returns:
-- Negative log marginal likelihood value (Float64), or Inf if parameters are invalid.
+# Returns
+Negative log marginal likelihood value (Float64), or Inf if parameters are invalid
+
+# Notes
+This function handles missing values (NaNs) in the observation vector
 """
 function negative_log_marginal_likelihood(log_params::Vector{Float64},
                                           y_obs_dim::Vector{Float64},
@@ -136,17 +139,18 @@ end
 Optimizes GP hyperparameters (variance, lengthscale, sigma) for a single dimension
 by minimizing the negative log marginal likelihood.
 
-Arguments:
-- y_obs_dim: Vector of observations for the current dimension.
-- t_obs: Vector of observation times.
-- kernel_type: String specifying the kernel type.
-- initial_log_params: Vector of initial guesses for [log(var), log(len), log(sigma)].
-- jitter: Jitter value for numerical stability (optional).
-- optim_options: Optim.Options for the optimizer (optional).
+# Arguments
+- `y_obs_dim`: Vector of observations for the current dimension
+- `t_obs`: Vector of observation times
+- `kernel_type`: String specifying the kernel type
+- `initial_log_params`: Vector of initial guesses for [log(var), log(len), log(sigma)]
+- `jitter`: Jitter value for numerical stability (optional)
+- `optim_options`: Optim.Options for the optimizer (optional)
 
-Returns:
-- Vector containing optimized [variance, lengthscale, sigma].
+# Returns
+Vector containing optimized [variance, lengthscale, sigma]
 """
+
 function optimize_gp_hyperparameters(y_obs_dim::Vector{Float64},
                                      t_obs::Vector{Float64},
                                      kernel_type::String,

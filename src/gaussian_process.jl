@@ -53,6 +53,20 @@ mutable struct GPCov
     end
 end
 
+
+"""
+    mat2band(mat_input, l, u)
+
+Convert a dense matrix to a banded matrix representation with specified bandwidths.
+
+# Arguments
+- `mat_input`: Dense input matrix
+- `l`: Lower bandwidth (number of subdiagonals)
+- `u`: Upper bandwidth (number of superdiagonals)
+
+# Returns
+A BandedMatrix with the specified bandwidths
+"""
 function mat2band(mat_input::AbstractMatrix{T}, l::Int, u::Int) where {T}
     # Ensure input is Float64 before creating BandedMatrix
     mat_float = convert(Matrix{Float64}, mat_input)
@@ -181,10 +195,26 @@ end
 
 
 """
-    calculate_gp_covariances!(...)
+    calculate_gp_covariances!(gp_cov::GPCov, kernel::KernelFunctions.Kernel,
+                             phi::Vector{Float64}, tvec::Vector{Float64}, 
+                             bandsize::Int; complexity::Int = 0, jitter::Float64 = 1e-7)
 
-Populates the GPCov struct. Includes derivative calculations for supported kernels.
-Applies jitter for numerical stability.
+Populates the GPCov struct with all necessary covariance matrices and their derivatives.
+This function is the core of the GP calculations needed for ODE inference.
+
+# Arguments
+- `gp_cov`: GPCov struct to be populated
+- `kernel`: KernelFunctions kernel object
+- `phi`: Vector of kernel hyperparameters
+- `tvec`: Vector of time points
+- `bandsize`: Size of band matrix approximation
+- `complexity`: Determines which derivatives to calculate (0 = basic, 2 = full derivatives)
+- `jitter`: Small value added to diagonal for numerical stability
+
+# Notes
+- When complexity ≥ 2, analytical derivatives of the kernel are calculated
+- Jitter is added to ensure positive definiteness of covariance matrices
+- Band matrix approximations are created for efficient computation
 """
 function calculate_gp_covariances!(
         gp_cov::GPCov,
