@@ -231,4 +231,4 @@ function log_likelihood_and_gradient_banded(
 end
 
 
-end # module Likelihoods
+end # module Likelihoodså
