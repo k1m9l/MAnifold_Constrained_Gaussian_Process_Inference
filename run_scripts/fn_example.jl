@@ -25,7 +25,7 @@ config = Dict{Symbol, Any}(
     :nobs => 41,                       # Number of observation points
     :noise => [0.2, 0.2],              # Noise SD for V and R
     :seed => rand(UInt32),             # Generate a random seed
-    :niterHmc => 5000, # 20000,       # HMC iterations (reduced for faster testing)
+    :niterHmc => 500, # 20000,       # HMC iterations (reduced for faster testing)
     :burninRatio => 0.5,               # Burn-in ratio
     :filllevel => 2,                   # Discretization level
     :t_start => 0.0,                   # Start time
@@ -52,7 +52,7 @@ end
 @printf("--- DEBUG: Random Seed set to: %d ---\n", config[:seed])
 
 # --- Output Directory ---
-outDir = "../results/fn/"
+outDir = joinpath(homedir(), "Desktop", "MAGI_OUTPUT") # Example absolute path
 mkpath(outDir) # Creates the directory if it doesn't exist
 println("--- DEBUG: Output directory set to: $outDir ---")
 
