@@ -114,8 +114,8 @@ high dimensions. NUTS automatically tunes the simulation length.
 function run_nuts_sampler(
         target::MagiTarget,
         initial_params::Vector{Float64}; # θ₀
-        n_samples::Int = 2000,           # Total iterations
-        n_adapts::Int = 1000,            # Warmup iterations
+        n_samples::Int = 20000,           # Total iterations
+        n_adapts::Int = 10000,            # Warmup iterations
         target_accept_ratio = 0.8,       # Target for MH acceptance
         initial_step_size = 0.1          # Initial integrator step size ϵ₀
     )

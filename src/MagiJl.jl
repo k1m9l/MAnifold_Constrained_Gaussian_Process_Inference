@@ -6,7 +6,14 @@
 Provides the Julia implementation of the MAnifold-constrained Gaussian process Inference (MAGI)
 method for Bayesian inference of Ordinary Differential Equation (ODE) parameters (θ) and
 latent state trajectories (x(t)) from noisy, sparse, and potentially partially observed data.
-... (rest of docstring) ...
+
+This module orchestrates the MAGI workflow, including:
+- Defining ODE systems and GP kernels.
+- Calculating GP covariance matrices and their derivatives.
+- Initializing parameters (θ, x(t), σ, ϕ) using data-driven heuristics and optimization.
+- Setting up the log-posterior density function compatible with `LogDensityProblems.jl`.
+- Running the NUTS sampler via `AdvancedHMC.jl` to obtain posterior samples.
+- Providing post-processing functions for summarizing and visualizing results.
 """
 module MagiJl
 
@@ -24,6 +31,8 @@ using Statistics               # For var, median, mean used in initialization/su
 using Optim                    # For GP hyperparameter optimization during initialization
 using Printf                   # For formatted printing in summary
 using Interpolations           # For linear interpolation in initialization
+using StatsPlots             # For plotting in postprocessing
+using Plots                   # For plotting in postprocessing
 
 # Optional Dependencies for Postprocessing (Load if available)
 using Requires
@@ -58,8 +67,8 @@ end
 include("ode_models.jl")
 include("kernels.jl")
 include("gaussian_process.jl")
-include("likelihoods.jl")
-include("logdensityproblems_interface.jl")
+include("likelihoods.jl") # Needs updated gradient calc for sigma
+include("logdensityproblems_interface.jl") # Needs updated dimension and unpacking
 include("samplers.jl")
 include("initialization.jl")
 # Postprocessing functions are now integrated directly below
@@ -84,7 +93,7 @@ export OdeSystem # Struct for ODE definition
 # Specific ODE system functions (examples)
 export fn_ode!, hes1_ode!, hes1log_ode!, hes1log_ode_fixg!, hes1log_ode_fixf!, hiv_ode!, ptrans_ode!
 # Specific ODE Jacobian functions (examples)
-export fn_ode_dx!, fn_ode_dθ, hes1_ode_dx!, hes1_ode_dθ # Note: Using θ in export name
+export fn_ode_dx!, fn_ode_dtheta, hes1_ode_dx!, hes1_ode_dtheta # Note: Using θ in export name
 
 # From kernels.jl
 export create_rbf_kernel, create_matern52_kernel, create_general_matern_kernel
@@ -108,7 +117,7 @@ export solve_magi
 export magi_summary, plot_magi, results_to_chain
 
 # =========================================================================
-# solve_magi function definition
+# solve_magi function definition - UPDATED to sample sigma
 # =========================================================================
 """
     solve_magi(
@@ -118,55 +127,142 @@ export magi_summary, plot_magi, results_to_chain
         config::Dict{Symbol,Any}=Dict{Symbol,Any}();
         initial_params=nothing
     )
-... (rest of docstring) ...
+
+Solves the MAGI inference problem.
+
+Estimates ODE parameters (θ), latent state trajectories (x(t)), and observation noise
+standard deviations (σ) from noisy observations `y_obs` at time points `t_obs`,
+given an ODE system definition `ode_system`.
+
+# Arguments
+- `y_obs::Matrix{Float64}`: Matrix of observations (n_times × n_dims). Use `NaN` for missing values.
+- `t_obs::Vector{Float64}`: Vector of time points corresponding to `y_obs` rows (discretization grid).
+- `ode_system::OdeSystem`: Struct containing the ODE function (`fOde`), Jacobians (`fOdeDx`, `fOdeDtheta`), parameter bounds, and size.
+- `config::Dict{Symbol,Any}`: Dictionary to control solver settings (optional). See details below.
+- `initial_params::Union{Vector{Float64}, Nothing}`: Optional. A single vector containing starting values for ALL parameters to be sampled: `[vec(x_init); theta_init; log(sigma_init)]`. If provided, it overrides individual initializations (`xInit`, `thetaInit`, initial `sigma` estimate). Default: `nothing`.
+
+# Config Options (Partial List)
+- `:kernel`: String, GP kernel type ("matern52", "rbf"). Default: "matern52".
+- `:niterHmc`: Int, total HMC iterations. Default: 20000.
+- `:burninRatio`: Float, proportion of iterations for warmup. Default: 0.5.
+- `:stepSizeFactor`: Float, initial HMC step size factor. Default: 0.01.
+- `:bandSize`: Int, band matrix approximation width. Default: 20.
+- `:priorTemperature`: Vector{Float}, tempering factors [β_deriv, β_level, β_obs]. Default: [1.0, 1.0, 1.0].
+- `:sigma`: Vector{Float}, known noise standard deviations σ. If provided (and `:phi` is also provided), σ is treated as fixed and NOT sampled. Default: `Float64[]` (σ is unknown and sampled).
+- `:phi`: Matrix{Float}, known GP hyperparameters [variance; lengthscale] per dimension. Must be provided if `:sigma` is provided and intended to be fixed. Default: `Matrix{Float64}(undef, 0, 0)` (ϕ is estimated).
+- `:xInit`: Matrix{Float}, initial guess for latent states x(t). Default: Linear interpolation of `y_obs`.
+- `:thetaInit`: Vector{Float}, initial guess for ODE parameters θ. Default: Midpoint of bounds or small offset.
+- `:targetAcceptRatio`: Float, target acceptance rate for HMC adaptation. Default: 0.8.
+- `:jitter`: Float, small value added for numerical stability. Default: 1e-6.
+- `:gpOptimIterations`: Int, iterations for GP hyperparameter optimization. Default: 100.
+- `:verbose`: Bool, print progress messages. Default: `false`.
+
+# Returns
+- `NamedTuple`: Contains the inference results:
+    - `theta::Matrix{Float64}`: Posterior samples for θ (n_samples × n_params_ode).
+    - `x_sampled::Array{Float64, 3}`: Posterior samples for x(t) (n_samples × n_times × n_dims).
+    - `sigma::Matrix{Float64}`: Posterior samples for σ (n_samples × n_dims) if σ was estimated, otherwise the fixed input σ repeated (n_samples x n_dims).
+    - `phi::Matrix{Float64}`: Used/estimated GP hyperparameters ϕ (2 × n_dims).
+    - `lp::Vector{Float64}`: Log-posterior density values for each sample.
+- `nothing`: If the solver encounters a critical error.
+
 """
 function solve_magi(
     y_obs::Matrix{Float64},       # Observations y(τ)
     t_obs::Vector{Float64},       # Time points t ∈ I (discretization grid)
     ode_system::OdeSystem,      # ODE definition (f, ∂f/∂x, ∂f/∂θ, bounds)
     config::Dict{Symbol,Any}=Dict{Symbol,Any}(); # Control dictionary
-    initial_params=nothing      # Optional full starting vector [vec(x₀); θ₀]
+    initial_params::Union{Vector{Float64}, Nothing}=nothing  # Optional full starting vector [vec(x₀); θ₀; log(σ₀)]
 )
     # --- Start of MAGI Workflow ---
     @info "Starting MAGI solver..."
     println("Input Data: $(size(y_obs, 1)) time points, $(size(y_obs, 2)) dimensions.")
     println("Time points from $(minimum(t_obs)) to $(maximum(t_obs)).")
     println("Using ODE System with $(ode_system.thetaSize) parameters.")
-    println("Config: ", config) # Be careful if config contains large xInit
+    # Print config carefully
+    print("Config: {")
+    config_items = []
+    for (k, v) in config
+        item_str = if k == :xInit && !isempty(v)
+             ":xInit => <matrix: $(size(v))>"
+        elseif k == :phi && !isempty(v)
+             ":phi => <matrix: $(size(v))>"
+        elseif v isa AbstractArray && length(v) > 10
+             ":$k => <array: $(typeof(v)), size=$(size(v))>"
+        elseif length(string(v)) > 100 # Avoid printing huge strings
+            ":$k => <$(typeof(v))>"
+        else
+            ":$k => $v"
+        end
+        push!(config_items, item_str)
+    end
+    println(join(config_items, ", "), "}")
+
 
     # --- 1 & 2: Extract Dimensions & Configuration Settings ---
-    # (Keep existing code)
-    # ...
     n_times = length(t_obs)       # Number of time points n
     n_dims = size(y_obs, 2)       # Number of state dimensions D
     n_params_ode = ode_system.thetaSize # Number of ODE parameters k
 
-    # Extract settings from config dictionary, using defaults if keys are absent
+    # Extract settings
     kernel_type = get(config, :kernel, "matern52")
-    niter_hmc = get(config, :niterHmc, 20000)       # Total HMC iterations
-    burnin_ratio = get(config, :burninRatio, 0.5)   # Warmup proportion
-    step_size_factor = get(config, :stepSizeFactor, 0.01) # Initial step size factor ϵ₀
-    band_size = get(config, :bandSize, 20)          # Band matrix width
-    prior_temperature = get(config, :priorTemperature, [1.0, 1.0, 1.0]) # Tempering β
-    sigma_exogenous = get(config, :sigma, Float64[]) # Provided σ?
-    phi_exogenous = get(config, :phi, Matrix{Float64}(undef, 0, 0)) # Provided ϕ?
-    x_init_exogenous = get(config, :xInit, Matrix{Float64}(undef, 0, 0)) # Provided x₀?
-    theta_init_exogenous = get(config, :thetaInit, Float64[]) # Provided θ₀?
-    target_accept_ratio = get(config, :targetAcceptRatio, 0.8) # HMC adaptation target
-    jitter = get(config, :jitter, 1e-6)             # Numerical stability factor
+    niter_hmc = get(config, :niterHmc, 20000)
+    burnin_ratio = get(config, :burninRatio, 0.5)
+    step_size_factor = get(config, :stepSizeFactor, 0.01)
+    band_size = get(config, :bandSize, 20)
+    prior_temperature = get(config, :priorTemperature, [1.0, 1.0, 1.0])
+    sigma_exogenous = get(config, :sigma, Float64[]) # Provided known σ?
+    phi_exogenous = get(config, :phi, Matrix{Float64}(undef, 0, 0)) # Provided known ϕ?
+    x_init_exogenous = get(config, :xInit, Matrix{Float64}(undef, 0, 0))
+    theta_init_exogenous = get(config, :thetaInit, Float64[])
+    target_accept_ratio = get(config, :targetAcceptRatio, 0.8)
+    jitter = get(config, :jitter, 1e-6)
+    verbose_print = get(config, :verbose, false) # Control internal prints
 
+    # Determine if sigma is fixed or needs to be sampled
+    # Sigma is fixed ONLY if BOTH sigma_exogenous AND phi_exogenous are provided
+    sigma_is_fixed = !isempty(sigma_exogenous) && !isempty(phi_exogenous)
+    if sigma_is_fixed
+        println("Sigma provided exogenously and treated as fixed.")
+        if length(sigma_exogenous) != n_dims
+             error("Provided :sigma vector has wrong length. Expected $n_dims, got $(length(sigma_exogenous)).")
+         end
+         if size(phi_exogenous) != (2, n_dims)
+             error("Provided :phi matrix has wrong dimensions when sigma is fixed. Expected (2, $n_dims), got $(size(phi_exogenous)).")
+         end
+    else
+        println("Sigma is treated as unknown and will be sampled.")
+        if !isempty(sigma_exogenous) && isempty(phi_exogenous)
+            @warn "Sigma provided but Phi not provided. Sigma will be treated as unknown and re-initialized."
+            sigma_exogenous = Float64[] # Reset sigma_exogenous to trigger initialization
+        end
+         if isempty(sigma_exogenous) && !isempty(phi_exogenous)
+            @warn "Phi provided but Sigma not provided. Sigma will be treated as unknown and initialized."
+            # Phi will still be used if provided, sigma will be initialized.
+        end
+    end
 
     # --- 3. Initialize GP Hyperparameters (ϕ) & Observation Noise (σ) ---
-    # (Keep existing code)
-    # ...
-    local ϕ_all_dimensions::Matrix{Float64} # GP params [var; len] for each dim D
-    local σ::Vector{Float64}             # Noise SD σ for each dim D
+    local ϕ_all_dimensions::Matrix{Float64}
+    local sigma_init::Vector{Float64} # Stores the *initial* value for sigma
 
-    if isempty(phi_exogenous) || isempty(sigma_exogenous)
-        # Option A: Estimate ϕ and σ using GP marginal likelihood optimization
-        println("Optimizing GP hyperparameters (ϕ and σ) using marginal likelihood...")
-        ϕ_all_dimensions = zeros(2, n_dims) # Store variance and lengthscale
-        σ = zeros(n_dims)
+    # Condition 1: Phi is NOT provided OR Sigma is NOT fixed (needs initialization)
+    if isempty(phi_exogenous) || !sigma_is_fixed
+
+        # Option A: Estimate ϕ and potentially σ using GP marginal likelihood optimization
+        if isempty(phi_exogenous) && isempty(sigma_exogenous)
+            println("Optimizing GP hyperparameters (ϕ and σ) using marginal likelihood...")
+        elseif isempty(phi_exogenous) && !isempty(sigma_exogenous) && !sigma_is_fixed # This case shouldn't happen due to logic above, but for safety
+             println("Optimizing GP hyperparameters (ϕ and σ) using marginal likelihood (sigma input ignored)...")
+        elseif !isempty(phi_exogenous) && isempty(sigma_exogenous)
+             println("Optimizing observation noise (σ) using marginal likelihood (using provided ϕ)...")
+        end
+
+        # Prepare storage
+        ϕ_est = zeros(2, n_dims)
+        σ_est = zeros(n_dims) # Only this is used if phi is exogenous but sigma is not
+
+        # Setup optimization
         optim_opts = Optim.Options(
             iterations = get(config, :gpOptimIterations, 100),
             show_trace = get(config, :gpOptimShowTrace, false),
@@ -176,94 +272,131 @@ function solve_magi(
 
         # Optimize for each dimension independently
         for dim in 1:n_dims
-            println("  Optimizing dimension $dim...")
+            if verbose_print println("  Optimizing dimension $dim...") end
             y_dim = y_obs[:, dim]
-            # Heuristic initial guesses based on data properties
+
+            # Initial guesses
             log_var_guess, log_len_guess, log_σ_guess = 0.0, 0.0, 0.0
             valid_y = filter(!isnan, y_dim)
             if !isempty(valid_y) && length(valid_y) > 1
                 var_y = var(valid_y; corrected=true)
                 data_range = maximum(valid_y) - minimum(valid_y)
                 time_range = maximum(t_obs) - minimum(t_obs)
-                # Median Absolute Deviation (MAD) as robust noise estimate
-                mad_val = median(abs.(valid_y .- median(valid_y))) * 1.4826 # Scale factor for normality
-                log_var_guess = log(max(var_y, 1e-4)) # Log signal variance guess
-                log_len_guess = log(max(time_range / 10.0, 1e-2)) # Log lengthscale guess
-                log_σ_guess = log(max(mad_val, 1e-3 * data_range, 1e-4)) # Log noise SD guess
-            else # Fallback if no/few observations
+                mad_val = median(abs.(valid_y .- median(valid_y))) * 1.4826
+                log_var_guess = log(max(var_y, 1e-4))
+                log_len_guess = log(max(time_range / 10.0, 1e-2))
+                log_σ_guess = log(max(mad_val, 1e-3 * data_range, 1e-4))
+            else
                 log_var_guess = log(1.0)
                 log_len_guess = log(max((maximum(t_obs) - minimum(t_obs)) / 10.0, 1e-2))
                 log_σ_guess = log(0.1)
             end
-            initial_log_params = [log_var_guess, log_len_guess, log_σ_guess]
-            println("    Initial guess [log(var), log(len), log(σ)]: ", round.(initial_log_params, digits=3))
 
-            # Call optimization routine from Initialization module
-            optimized_params = Initialization.optimize_gp_hyperparameters(
-                y_dim, t_obs, kernel_type, initial_log_params;
-                jitter=jitter, optim_options=optim_opts
-            )
-            println("    Optimized [var, len, σ]: ", round.(optimized_params, digits=4))
+            # Use provided phi if available, otherwise use guess
+            initial_log_params = if isempty(phi_exogenous)
+                 [log_var_guess, log_len_guess, log_σ_guess]
+             else
+                 # Use provided phi, only guess sigma
+                 [log(phi_exogenous[1, dim]), log(phi_exogenous[2, dim]), log_σ_guess]
+            end
+             if verbose_print println("    Initial guess [log(var), log(len), log(σ)]: ", round.(initial_log_params, digits=3)) end
+
+            # Call optimization routine
+            # Need to handle potential errors during optimization
+             local optimized_params
+             try
+                optimized_params = Initialization.optimize_gp_hyperparameters(
+                    y_dim, t_obs, kernel_type, initial_log_params;
+                    jitter=jitter, optim_options=optim_opts
+                )
+             catch opt_err
+                @error "GP Hyperparameter optimization failed for dimension $dim." exception=(opt_err, catch_backtrace())
+                @warn "Using initial guess as optimization result for dimension $dim."
+                optimized_params = exp.(initial_log_params) # Fallback to initial guess
+             end
+
+             if verbose_print println("    Optimized [var, len, σ]: ", round.(optimized_params, digits=4)) end
 
             # Store optimized values
-            ϕ_all_dimensions[1, dim] = optimized_params[1] # Variance
-            ϕ_all_dimensions[2, dim] = optimized_params[2] # Lengthscale
-            σ[dim] = optimized_params[3]                   # Noise SD
+            if isempty(phi_exogenous)
+                ϕ_est[1, dim] = optimized_params[1] # Variance
+                ϕ_est[2, dim] = optimized_params[2] # Lengthscale
+            end
+            # Always store the estimated sigma if sigma is not fixed
+            if !sigma_is_fixed
+                # Ensure estimated sigma is positive, fallback if needed
+                σ_est[dim] = max(optimized_params[3], 1e-8)
+            end
         end
-        println("Optimization complete.")
 
-    elseif isempty(phi_exogenous) && !isempty(sigma_exogenous)
-         error("If providing :sigma exogenously, must also provide :phi.")
-    elseif !isempty(phi_exogenous) && isempty(sigma_exogenous)
-         error("If providing :phi exogenously, must also provide :sigma.")
+        # Assign estimated values
+        ϕ_all_dimensions = isempty(phi_exogenous) ? ϕ_est : phi_exogenous
+        # sigma_init gets the estimated value if sigma is not fixed
+        sigma_init = sigma_is_fixed ? sigma_exogenous : σ_est
+
+        if verbose_print println("Initialization optimization complete.") end
+
     else
-         # Option B: Use exogenously provided ϕ and σ
-         if size(phi_exogenous) != (2, n_dims)
-             error("Provided :phi matrix has wrong dimensions. Expected (2, $n_dims), got $(size(phi_exogenous)).")
-         end
-         if length(sigma_exogenous) != n_dims
-             error("Provided :sigma vector has wrong length. Expected $n_dims, got $(length(sigma_exogenous)).")
-         end
-         ϕ_all_dimensions = phi_exogenous
-         σ = sigma_exogenous
-         println("Using exogenously provided ϕ and σ.")
-     end
+        # Option B: Use exogenously provided (fixed) ϕ and σ
+        ϕ_all_dimensions = phi_exogenous
+        sigma_init = sigma_exogenous # sigma_init stores the fixed value
+        println("Using exogenously provided fixed ϕ and σ.")
+    end
+
     println("Using ϕ (GP hyperparameters):\n", round.(ϕ_all_dimensions, digits=4))
-    println("Using σ (observation noise SD): ", round.(σ, digits=4))
+    println("Initial σ (observation noise SD): ", round.(sigma_init, digits=4))
+    if sigma_is_fixed println("(Sigma will remain fixed during sampling)") end
 
 
     # --- 3. Initialize Latent States (x) ---
-    local x_init::Matrix{Float64} # Initial trajectory x(I)₀
+    local x_init::Matrix{Float64}
     if isempty(x_init_exogenous)
         # Option A: Initialize x via linear interpolation
         println("Initializing latent states x via linear interpolation...")
         x_init = zeros(n_times, n_dims)
         for dim in 1:n_dims
-            valid_indices = findall(!isnan, y_obs[:, dim]) # Find observed points for this dim
+            valid_indices = findall(!isnan, y_obs[:, dim])
             if isempty(valid_indices)
-                # Handle completely unobserved components
-                x_init[:, dim] .= 0.0 # Simple default: initialize with zeros
+                x_init[:, dim] .= 0.0
                 @warn "No observations found for dimension $dim. Initializing x with zeros."
                 continue
             end
-            # Interpolate based on observed times and values
             valid_times = t_obs[valid_indices]
             valid_values = y_obs[valid_indices, dim]
 
-            # Check if enough points for interpolation
             if length(valid_indices) < 2
                  @warn "Dimension $dim has fewer than 2 observations. Using constant extrapolation for initialization."
-                 # Use the single observed value for all time points
                  x_init[:, dim] .= valid_values[1]
                  continue
             end
+            # Create interpolation object safely
+             local itp
+             try
+                 # Ensure unique time points for interpolation
+                 unique_indices = unique(i -> valid_times[i], 1:length(valid_times))
+                 if length(unique_indices) < length(valid_times)
+                     @warn "Duplicate time points found for interpolation in dim $dim. Using unique points."
+                 end
+                 unique_times = valid_times[unique_indices]
+                 unique_values = valid_values[unique_indices]
 
-            # Use Interpolations.jl for robust linear interpolation and extrapolation
-            # Ensure valid_times are strictly increasing if required by Interpolations.jl
-            # (May need sorting and handling duplicate times if they exist)
-            # Example assumes valid_times are sorted and unique after findall
-            itp = LinearInterpolation(valid_times, valid_values, extrapolation_bc=Line()) # Use Line extrapolation
-            x_init[:, dim] .= itp.(t_obs) # Apply interpolation to all t_obs points
+                 if length(unique_times) < 2 # Check again after unique
+                      @warn "Dimension $dim has fewer than 2 unique observation times. Using constant extrapolation."
+                      x_init[:, dim] .= unique_values[1]
+                      continue
+                 end
+                 # Sort points just in case findall didn't return sorted indices
+                 sort_perm = sortperm(unique_times)
+                 sorted_times = unique_times[sort_perm]
+                 sorted_values = unique_values[sort_perm]
+
+                 itp = linear_interpolation(sorted_times, sorted_values, extrapolation_bc=Line())
+                 x_init[:, dim] .= itp.(t_obs) # Apply interpolation
+             catch itp_err
+                 @error "Linear interpolation failed for dimension $dim." exception=(itp_err, catch_backtrace())
+                 @warn "Falling back to zero initialization for dimension $dim."
+                 x_init[:, dim] .= 0.0
+             end
 
         end
         println("Latent state initialization complete.")
@@ -277,9 +410,7 @@ function solve_magi(
     end
 
     # --- 3. Initialize ODE Parameters (θ) ---
-    # (Keep existing code)
-    # ...
-    local θ_init::Vector{Float64} # Initial ODE parameters θ₀
+    local θ_init::Vector{Float64}
     if isempty(theta_init_exogenous)
         # Option A: Initialize θ based on parameter bounds
         println("Initializing ODE parameters θ based on bounds...")
@@ -287,25 +418,24 @@ function solve_magi(
         for i in 1:n_params_ode
             lb = ode_system.thetaLowerBound[i]
             ub = ode_system.thetaUpperBound[i]
-            # Set initial guess, preferring midpoint if bounds are finite
+            # Set initial guess
             if isfinite(lb) && isfinite(ub)
                 θ_init[i] = (lb + ub) / 2.0
             elseif isfinite(lb)
-                θ_init[i] = lb + abs(lb)*0.1 + 0.1 # Guess slightly above lower bound
+                θ_init[i] = lb + abs(lb)*0.1 + 0.1
             elseif isfinite(ub)
-                θ_init[i] = ub - abs(ub)*0.1 - 0.1 # Guess slightly below upper bound
+                θ_init[i] = ub - abs(ub)*0.1 - 0.1
             else
-                θ_init[i] = 0.0 # Default guess for unbounded parameters
+                θ_init[i] = 0.0
             end
-             # Ensure guess is strictly within bounds, nudging if necessary
+             # Nudge within bounds
              if isfinite(lb) && θ_init[i] <= lb
-                 θ_init[i] = lb + 1e-4 * (isfinite(ub) ? min(1.0, ub-lb) : 1.0) # Small nudge
+                 θ_init[i] = lb + 1e-4 * (isfinite(ub) ? min(1.0, ub-lb) : 1.0)
              end
              if isfinite(ub) && θ_init[i] >= ub
-                 θ_init[i] = ub - 1e-4 * (isfinite(lb) ? min(1.0, ub-lb) : 1.0) # Small nudge
+                 θ_init[i] = ub - 1e-4 * (isfinite(lb) ? min(1.0, ub-lb) : 1.0)
              end
-             # Final clamp for safety, although nudging should prevent hitting bounds
-             θ_init[i] = clamp(θ_init[i], lb, ub)
+             θ_init[i] = clamp(θ_init[i], lb, ub) # Final clamp
         end
     else
          # Option B: Use exogenously provided θ_init
@@ -313,7 +443,7 @@ function solve_magi(
              error("Provided :thetaInit vector has wrong length. Expected $n_params_ode, got $(length(theta_init_exogenous)).")
          end
         θ_init = theta_init_exogenous
-        # Check if provided θ₀ respects bounds
+        # Check bounds
         if any(θ_init .< ode_system.thetaLowerBound) || any(θ_init .> ode_system.thetaUpperBound)
              @warn "Provided :thetaInit contains values outside the specified bounds. Clamping initial values."
              θ_init = clamp.(θ_init, ode_system.thetaLowerBound, ode_system.thetaUpperBound)
@@ -324,179 +454,208 @@ function solve_magi(
 
 
     # --- 4. Calculate GPCov Structs ---
-    # (Keep existing code)
-    # ...
     @info "Calculating GP Covariance structures..."
     cov_all_dimensions = Vector{GPCov}(undef, n_dims)
-    actual_band_size = min(band_size, n_times - 1) # Ensure band size isn't too large
-     if actual_band_size < 0
-        actual_band_size = 0 # Handle n_times=1 case
-    end
-    println("Using Band Size: $actual_band_size (Requested: $band_size)")
+    actual_band_size = min(band_size, n_times - 1)
+     if actual_band_size < 0; actual_band_size = 0; end
+    if verbose_print println("Using Band Size: $actual_band_size (Requested: $band_size)") end
 
-    # Create kernel and calculate covariances for each dimension
     for dim in 1:n_dims
-        cov_all_dimensions[dim] = GPCov() # Initialize empty GPCov struct
-        local kernel # Ensure kernel is defined in this scope
-        ϕ_dim = ϕ_all_dimensions[:, dim] # Get [var; len] for this dimension
-        var = ϕ_dim[1]
-        len = ϕ_dim[2]
-
-        # Create the specified kernel using functions from Kernels module
+        cov_all_dimensions[dim] = GPCov()
+        local kernel
+        ϕ_dim = ϕ_all_dimensions[:, dim]
+        var = ϕ_dim[1]; len = ϕ_dim[2]
+        # Check for invalid phi values
+        if !isfinite(var) || var <= 0 || !isfinite(len) || len <= 0
+            @error "Invalid GP hyperparameters for dimension $dim: variance=$var, lengthscale=$len. Check initialization or provided :phi."
+            return nothing # Critical error
+        end
         if kernel_type == "matern52"
             kernel = Kernels.create_matern52_kernel(var, len)
         elseif kernel_type == "rbf"
             kernel = Kernels.create_rbf_kernel(var, len)
-        # Add other kernel types here if implemented
         else
             @warn "Unsupported kernel type '$kernel_type'. Defaulting to matern52."
             kernel = Kernels.create_matern52_kernel(var, len)
         end
-
-        # Populate the GPCov struct with calculated matrices (dense & banded)
         try
              calculate_gp_covariances!(
                  cov_all_dimensions[dim], kernel, ϕ_dim, t_obs, actual_band_size;
-                 complexity=2, # Calculate necessary derivatives for MAGI
-                 jitter=jitter
+                 complexity=2, jitter=jitter
              )
         catch e
-             @error "Failed to calculate GP covariances for dimension $dim." phi=ϕ_dim kernel=kernel bandsize=actual_band_size jitter=jitter
-             rethrow(e) # Stop execution if GP setup fails
+             @error "Failed to calculate GP covariances for dimension $dim." phi=ϕ_dim kernel=kernel bandsize=actual_band_size jitter=jitter exception=(e, catch_backtrace())
+             # Decide if this is recoverable or should stop
+              return nothing # Stop execution if GP setup fails crucially
          end
     end
     @info "GP Covariance calculation complete."
 
 
     # --- 5. Define Log Posterior Target ---
-    # (Keep existing code)
-    # ...
+    # Use the *initial* sigma value (sigma_init) for the MagiTarget struct.
+    # The sampler will use the sampled sigma values internally via the logdensity functions.
     if !(typeof(prior_temperature) <: AbstractVector && length(prior_temperature) == 3)
-         @warn "priorTemperature β should be a vector of 3 floats [β_deriv, β_level, β_obs]. Using default [1.0, 1.0, 1.0] or first element if scalar."
-         # Attempt to gracefully handle incorrect input format
-         scalar_temp = first(prior_temperature) # Take first element if it's a scalar/vector
-         prior_temps = fill(Float64(scalar_temp), 3)
+        @warn "priorTemperature β should be a vector of 3 floats [β_deriv, β_level, β_obs]. Using default [1.0, 1.0, 1.0] or first element if scalar."
+        scalar_temp = first(prior_temperature)
+        prior_temps = fill(Float64(scalar_temp), 3)
     else
-         prior_temps = convert(Vector{Float64}, prior_temperature) # Ensure Float64
+        prior_temps = convert(Vector{Float64}, prior_temperature)
     end
-    println("Using Prior Temperatures β [Deriv, Level, Obs]: ", prior_temps)
+    if verbose_print println("Using Prior Temperatures β [Deriv, Level, Obs]: ", prior_temps) end
 
+    # Pass the *initial* sigma_init to the target struct constructor
     target = MagiTarget(
-        y_obs,              # Observations y(τ)
-        cov_all_dimensions, # Vector of GPCov structs
-        ode_system.fOde,    # ODE function f
-        ode_system.fOdeDx,  # ODE Jacobian ∂f/∂x
-        ode_system.fOdeDtheta,# ODE Jacobian ∂f/∂θ
-        σ,                  # Noise SDs σ
-        prior_temps,        # Tempering factors β
-        n_times,            # n
-        n_dims,             # D
-        n_params_ode        # k
+        y_obs,
+        cov_all_dimensions,
+        ode_system.fOde,
+        ode_system.fOdeDx,
+        ode_system.fOdeDtheta,
+        sigma_init,          # <<< Pass the initial sigma here
+        prior_temps,
+        n_times,
+        n_dims,
+        n_params_ode,
+        sigma_is_fixed
     )
     @info "MagiTarget for LogDensityProblems created."
 
 
     # --- 6. Initialize Full Parameter Vector for Sampler ---
-    # (Keep existing code)
-    # ...
-    local params_init::Vector{Float64} # Combined initial state [vec(x₀); θ₀]
+    # This vector structure depends on whether sigma is fixed or sampled
+    local params_init::Vector{Float64}
+
     if initial_params === nothing
-        # Concatenate the initialized x₀ and θ₀
-        params_init = vcat(vec(x_init), θ_init)
+        # Construct initial parameters based on individual initializations
+        log_sigma_init = log.(max.(sigma_init, 1e-8)) # Transform to log-scale, ensure positive argument
+
+        if sigma_is_fixed
+            # Sampler only sees x and theta
+            params_init = vcat(vec(x_init), θ_init)
+            println("Initializing sampler with x and theta only (sigma fixed).")
+        else
+            # Sampler sees x, theta, and log_sigma
+            params_init = vcat(vec(x_init), θ_init, log_sigma_init)
+            println("Initializing sampler with x, theta, and log_sigma.")
+        end
     else
          # Use the exogenously provided full parameter vector
-         if length(initial_params) != (n_times * n_dims + n_params_ode)
-             error("Provided initial_params vector has wrong length. Expected $(n_times * n_dims + n_params_ode), got $(length(initial_params)).")
+         expected_len = n_times * n_dims + n_params_ode + (sigma_is_fixed ? 0 : n_dims)
+         if length(initial_params) != expected_len
+             error("Provided initial_params vector has wrong length. Expected $expected_len, got $(length(initial_params)). Check if sigma should be included.")
          end
         params_init = initial_params
-        # Check bounds for the θ part of the provided vector
-        θ_part_init = initial_params[(n_times * n_dims + 1):end]
+
+        # Check bounds for the θ part
+        theta_start_idx = n_times * n_dims + 1
+        theta_end_idx = n_times * n_dims + n_params_ode
+        θ_part_init = @view initial_params[theta_start_idx:theta_end_idx]
          if any(θ_part_init .< ode_system.thetaLowerBound) || any(θ_part_init .> ode_system.thetaUpperBound)
-             @warn "θ part of provided initial_params contains values outside bounds. Sampler might struggle or reject states."
+             @warn "θ part of provided initial_params contains values outside bounds. Clamping initial values."
+             # Create copy before modifying if initial_params should remain unchanged
+             params_init = copy(initial_params)
+             params_init[theta_start_idx:theta_end_idx] = clamp.(θ_part_init, ode_system.thetaLowerBound, ode_system.thetaUpperBound)
+         end
+
+         # Check positivity for the sigma part if it's included and sampled
+         if !sigma_is_fixed
+             log_sigma_part_init = @view initial_params[(theta_end_idx + 1):end]
+             # Initial sigma values derived from this log_sigma should be positive
+             if any(!isfinite, log_sigma_part_init) || any(s -> s <= 0, exp.(log_sigma_part_init))
+                 @warn "log_sigma part of provided initial_params implies non-positive sigma values. Sampler might struggle."
+             end
          end
          println("Using exogenously provided full initial parameter vector.")
     end
-    total_params_dim = length(params_init)
-    println("Total number of parameters being sampled: $total_params_dim")
+
+    # Calculate total dimension being sampled
+    total_params_dim_sampling = length(params_init)
+    println("Total number of parameters being sampled by HMC: $total_params_dim_sampling")
 
 
     # --- 7. Run Sampler ---
-    # (Keep existing code)
-    # ...
     @info "Setting up and running NUTS sampler..."
-    n_adapts = Int(floor(niter_hmc * burnin_ratio)) # Number of warmup steps
-    n_samples_total = niter_hmc                     # Total HMC iterations
-    n_samples_keep = n_samples_total - n_adapts     # Number of samples after warmup
-    initial_step_size = step_size_factor            # Initial step size ϵ₀
+    n_adapts = Int(floor(niter_hmc * burnin_ratio))
+    n_samples_total = niter_hmc
+    n_samples_keep = n_samples_total - n_adapts
+    initial_step_size = step_size_factor
 
-    # Initialize chain and stats outside try block
-    local chain = nothing # To store the MCMC samples
-    local stats = nothing # To store sampler statistics
+    local chain = nothing
+    local stats = nothing
 
     try
-        # Run the NUTS sampler (defined in samplers.jl)
+        # Run the NUTS sampler
+        # The target object (via LogDensityProblems interface) now handles the correct dimensions
+        # Ensure the interface implementation reflects the sampled parameters
         chain, stats = run_nuts_sampler(
-            target,              # The MagiTarget object defining logπ and ∇logπ
-            params_init;         # The starting parameter vector [vec(x₀); θ₀]
-            n_samples = n_samples_total, # Total iterations
-            n_adapts = n_adapts,         # Warmup iterations
-            target_accept_ratio = target_accept_ratio, # Target for MH step
-            initial_step_size = initial_step_size      # Initial step size ϵ₀
+            target,
+            params_init;
+            n_samples = n_samples_total,
+            n_adapts = n_adapts,
+            target_accept_ratio = target_accept_ratio,
+            initial_step_size = initial_step_size
         )
     catch sampler_err
         @error "Error occurred during run_nuts_sampler call." exception=(sampler_err, catch_backtrace())
         chain = nothing
         stats = nothing
-        # Option: rethrow(sampler_err) # Stop execution immediately
+        # Depending on severity, may want to return nothing here
+        # return nothing
     end
 
-    # --- Debugging Output ---
-    println("--- solve_magi DEBUG: Sampler returned. ---")
-    println("--- solve_magi DEBUG: Type of chain: $(typeof(chain))")
-    if chain !== nothing
-        println("--- solve_magi DEBUG: Chain Is empty: $(isempty(chain)), Length: $(length(chain)) ---")
+    # --- Debugging Output (Optional) ---
+    if verbose_print
+        println("--- solve_magi DEBUG: Sampler returned. ---")
+        println("--- solve_magi DEBUG: Type of chain: $(typeof(chain))")
+        if chain !== nothing
+            println("--- solve_magi DEBUG: Chain Is empty: $(isempty(chain)), Length: $(length(chain)) ---")
+            if !isempty(chain)
+                println("--- solve_magi DEBUG: Type of first element: $(typeof(first(chain)))")
+            end
+        end
+        println("--- solve_magi DEBUG: Type of stats: $(typeof(stats))")
+         if stats !== nothing
+            println("--- solve_magi DEBUG: Stats Is empty: $(isempty(stats)), Length: $(try length(stats) catch; -1 end) ---")
+            if !isempty(stats)
+                println("--- solve_magi DEBUG: Type of first stat: $(typeof(first(stats)))")
+            end
+         end
     end
-    println("--- solve_magi DEBUG: Type of stats: $(typeof(stats))")
-     if stats !== nothing
-        println("--- solve_magi DEBUG: Stats Is empty: $(isempty(stats)), Length: $(try length(stats) catch; -1 end) ---")
-     end
-    # --- End Debugging Output ---
-
 
     # Check if sampling was successful
     if chain === nothing || isempty(chain)
         @error "Sampling failed or returned no samples. Check sampler logs or errors above."
-        # Return nothing to indicate critical failure
         return nothing
     end
     @info "Sampling completed."
 
 
     # --- 8. Process Results ---
-    # (Keep existing code)
-    # ...
     @info "Processing MCMC samples..."
-    println("--- solve_magi DEBUG: Entering results processing block. ---")
+    if verbose_print println("--- solve_magi DEBUG: Entering results processing block. ---") end
 
-    # Declare variables for processed results
     local samples_post_burnin_matrix::Matrix{Float64}
     local x_samples::Array{Float64, 3}
     local θ_samples::Matrix{Float64}
+    local sigma_samples::Matrix{Float64} # Changed type
     local lp_values::Vector{Float64}
 
     try
-        # Ensure chain is a Vector of Vectors (standard output from AdvancedHMC)
+        # Ensure chain format
         if !(chain isa Vector) || (length(chain)>0 && !(first(chain) isa AbstractVector))
              error("Sampler output 'chain' is not a Vector of Vectors as expected. Type: $(typeof(chain))")
+        end
+        if size(first(chain), 1) != total_params_dim_sampling
+            error("Sampler output chain element dimension ($(size(first(chain), 1))) does not match expected sampling dimension ($total_params_dim_sampling).")
         end
 
         # Convert vector of sample vectors into a matrix (dims × samples)
         samples_post_burnin_matrix = hcat(chain...)
-        println("--- solve_magi DEBUG: samples_post_burnin_matrix size: $(size(samples_post_burnin_matrix)) ---")
+        if verbose_print println("--- solve_magi DEBUG: samples_post_burnin_matrix size: $(size(samples_post_burnin_matrix)) ---") end
 
         n_samples_post_burnin = size(samples_post_burnin_matrix, 2)
 
-        # Verify number of samples returned matches expectation
+        # Verify sample count
         if n_samples_post_burnin != n_samples_keep
              @warn "Number of samples after warmup ($(n_samples_post_burnin)) does not match expected ($(n_samples_keep)). Check sampler's drop_warmup setting or output."
              if n_samples_post_burnin == 0
@@ -504,94 +663,129 @@ function solve_magi(
              end
         end
 
-        # Define indices for x and θ within the flattened parameter vector
+        # Define indices based on whether sigma was sampled
         x_indices = 1:(n_times * n_dims)
-        θ_indices = (n_times * n_dims + 1):(total_params_dim)
+        theta_indices = (n_times * n_dims + 1):(n_times * n_dims + n_params_ode)
+        if !sigma_is_fixed
+             log_sigma_indices = (n_times * n_dims + n_params_ode + 1):total_params_dim_sampling
+             if length(log_sigma_indices) != n_dims
+                error("Indexing error: Number of log_sigma indices ($(length(log_sigma_indices))) does not match n_dims ($n_dims).")
+             end
+        end
 
         # Extract and reshape x samples
-        x_samples_flat = samples_post_burnin_matrix[x_indices, :] # (n*D) × n_samples
-        # Reshape into (n_samples × n_times × n_dims)
+        x_samples_flat = samples_post_burnin_matrix[x_indices, :]
         x_samples = Array{Float64, 3}(undef, n_samples_post_burnin, n_times, n_dims)
-        println("--- solve_magi DEBUG: Initialized x_samples array size: $(size(x_samples)) ---")
+        # Check dimensions before reshaping loop
+        @assert size(x_samples_flat) == (n_times * n_dims, n_samples_post_burnin) "Dimension mismatch for x_samples_flat"
         for i in 1:n_samples_post_burnin
-            # Reshape each sample vector and store it
+            # Use view for efficiency
             x_samples[i, :, :] = reshape(view(x_samples_flat, :, i), n_times, n_dims)
         end
-        println("--- solve_magi DEBUG: Reshaped x_samples successfully. ---")
+        if verbose_print println("--- solve_magi DEBUG: Reshaped x_samples successfully.") end
 
-        # Extract and transpose θ samples to get (n_samples × n_params)
-        θ_samples = Matrix(samples_post_burnin_matrix[θ_indices, :]')
-        println("--- solve_magi DEBUG: Created θ_samples matrix size: $(size(θ_samples)) ---")
+        # Extract θ samples
+        θ_samples_flat = samples_post_burnin_matrix[theta_indices, :]
+        @assert size(θ_samples_flat) == (n_params_ode, n_samples_post_burnin) "Dimension mismatch for θ_samples_flat"
+        θ_samples = Matrix(θ_samples_flat') # Transpose to get (n_samples × n_params)
+        if verbose_print println("--- solve_magi DEBUG: Created θ_samples matrix size: $(size(θ_samples)) ---") end
+
+        # Extract sigma samples (if sampled) or use fixed value
+        if sigma_is_fixed
+            # Repeat the fixed initial sigma for all "samples"
+            sigma_samples = repeat(reshape(sigma_init, 1, n_dims), n_samples_post_burnin, 1)
+            if verbose_print println("--- solve_magi DEBUG: Using fixed sigma values.") end
+        else
+            # Extract log_sigma samples and transform back
+            log_sigma_samples_flat = samples_post_burnin_matrix[log_sigma_indices, :]
+            @assert size(log_sigma_samples_flat) == (n_dims, n_samples_post_burnin) "Dimension mismatch for log_sigma_samples_flat"
+            sigma_samples = exp.(Matrix(log_sigma_samples_flat')) # Transpose first, then exp. -> (n_samples × n_dims)
+            if verbose_print println("--- solve_magi DEBUG: Created sigma_samples matrix size: $(size(sigma_samples)) ---") end
+        end
 
         # Extract log-posterior values from stats (if available)
         lp_values = Float64[] # Initialize as empty
-        println("--- solve_magi DEBUG: Attempting to extract lp_values... ---")
+        if verbose_print println("--- solve_magi DEBUG: Attempting to extract lp_values... ---") end
         if stats !== nothing && stats isa Vector && !isempty(stats) && length(stats) == n_samples_post_burnin
-             first_stat = first(stats) # Check the structure of the first stats object
-             println("--- solve_magi DEBUG: stats[1] type: $(typeof(first_stat)), fields: $(try fieldnames(typeof(first_stat)) catch; "N/A" end) ---")
-             # Check for common fields storing log-posterior
-             if hasproperty(first_stat, :lp) # AdvancedHMC often uses :lp
-                 lp_values = [s.lp for s in stats]
-                 println("--- solve_magi DEBUG: Extracted lp_values using :lp field. Length: $(length(lp_values)) ---")
-             elseif hasproperty(first_stat, :log_density) # Another possibility
-                 lp_values = [s.log_density for s in stats]
-                 println("--- solve_magi DEBUG: Extracted lp_values using :log_density field. Length: $(length(lp_values)) ---")
+             first_stat = first(stats)
+             if verbose_print println("--- solve_magi DEBUG: stats[1] type: $(typeof(first_stat)), fields: $(try fieldnames(typeof(first_stat)) catch; "N/A" end) ---") end
+             # Check fields robustly
+             lp_field = :lp
+             if !hasproperty(first_stat, lp_field)
+                 if hasproperty(first_stat, :log_density)
+                     lp_field = :log_density
+                 else
+                     lp_field = :not_found # Indicate field not found
+                 end
+             end
+
+             if lp_field != :not_found
+                 try
+                     lp_values = [getproperty(s, lp_field) for s in stats]
+                     if verbose_print println("--- solve_magi DEBUG: Extracted lp_values using :$lp_field field. Length: $(length(lp_values)) ---") end
+                 catch lp_err
+                     @warn "Error extracting log posterior values using field '$lp_field'." exception=(lp_err, catch_backtrace())
+                     lp_values = Float64[] # Reset if extraction failed
+                 end
              else
-                 @warn "Sampler statistics vector does not contain standard :lp or :log_density field."
-                 println("--- solve_magi DEBUG: Could not find :lp or :log_density in stats objects.")
+                  @warn "Sampler statistics vector does not contain standard :lp or :log_density field."
+                  if verbose_print println("--- solve_magi DEBUG: Could not find :lp or :log_density in stats objects.") end
              end
         else
-             stats_type = typeof(stats)
-             stats_len = try length(stats) catch; -1 end
+             stats_type = typeof(stats); stats_len = try length(stats) catch; -1 end
              @warn "Log posterior values (lp) could not be extracted. Stats structure unexpected or length mismatch. Type: $stats_type, Length: $stats_len, Expected: Vector of length $n_samples_post_burnin."
-             println("--- solve_magi DEBUG: Stats structure unexpected or mismatch, cannot extract lp_values.")
+             if verbose_print println("--- solve_magi DEBUG: Stats structure unexpected or mismatch, cannot extract lp_values.") end
         end
+        # Ensure lp_values is always a Vector{Float64}, even if empty
+        if !isa(lp_values, Vector{Float64}) || length(lp_values) != n_samples_post_burnin
+             if isempty(lp_values) && n_samples_post_burnin > 0 # Only warn if samples exist but lp extraction failed
+                 @warn "Log posterior values (lp) could not be extracted. Returning empty vector."
+             end
+             lp_values = Float64[] # Ensure it's an empty Float64 vector if extraction failed or resulted in wrong type/length
+        end
+
+
         @info "Finished processing results."
 
     catch process_err
         @error "Error during results processing block!" exception=(process_err, catch_backtrace())
-        # Return nothing if processing fails
         return nothing
     end
 
-    # --- Final Debug Print ---
-    println("--- solve_magi DEBUG: Preparing to return NamedTuple... ---")
-    # --- End Final Debug Print ---
+    # --- Final Debug Print (Optional) ---
+    if verbose_print println("--- solve_magi DEBUG: Preparing to return NamedTuple... ---") end
 
-    # Ensure all essential result variables were successfully assigned
-    if !@isdefined(θ_samples) || !@isdefined(x_samples) || !@isdefined(lp_values)
-         @error "Results processing did not complete successfully (θ_samples, x_samples, or lp_values not defined). Cannot return standard output."
-         return nothing # Indicate failure
+    # Ensure essential variables are defined
+    if !@isdefined(θ_samples) || !@isdefined(x_samples) || !@isdefined(sigma_samples) || !@isdefined(lp_values)
+         @error "Results processing did not complete successfully (essential variables not defined)."
+         return nothing
     end
 
-    # Return results as a NamedTuple for easy access
+    # Return results as a NamedTuple
     return (
         theta = θ_samples,         # Posterior samples for θ (n_samples × k)
         x_sampled = x_samples,     # Posterior samples for x(I) (n_samples × n × D)
-        sigma = reshape(σ, 1, n_dims), # Used/estimated noise SD σ (1 × D)
+        sigma = sigma_samples,     # Samples (n_samples × D) or Fixed repeated (n_samples × D)
         phi = ϕ_all_dimensions,    # Used/estimated GP params ϕ (2 × D)
-        lp = lp_values             # Log-posterior values (n_samples)
+        lp = lp_values             # Log-posterior values (n_samples), empty if unavailable
     )
 
 end # end solve_magi
 
 
 # =========================================================================
-# Postprocessing Functions
+# Postprocessing Functions - UPDATED for sampled sigma
 # =========================================================================
 """
     results_to_chain(results::NamedTuple; par_names=nothing, include_sigma=false, include_lp=false)
 
-Convert the θ samples (and optionally σ, lp) from `solve_magi` results
-into an `MCMCChains.Chains` object for use with the `MCMCChains.jl` ecosystem
-(e.g., for diagnostics, plotting, summaries).
-
+Convert the MCMC samples from `solve_magi` results into an `MCMCChains.Chains` object.
 Requires the `MCMCChains` package to be loaded.
 
 # Arguments
 - `results::NamedTuple`: The output from `solve_magi`.
 - `par_names::Union{Vector{String}, Nothing}`: Optional names for the θ parameters. Length must match `n_params_ode`.
-- `include_sigma::Bool`: If true, include the fixed/estimated σ values as parameters in the chain. Default: `false`.
+- `include_sigma::Bool`: If true, include the σ samples (or fixed value) as parameters in the chain. Default: `false`.
 - `include_lp::Bool`: If true, include the log-posterior values as a parameter in the chain. Default: `false`.
 
 # Returns
@@ -602,55 +796,90 @@ function results_to_chain(results::NamedTuple; par_names=nothing, include_sigma=
          error("MCMCChains package is required for results_to_chain function. Please install and load it (`using MCMCChains`).")
     end
 
-    # Access MCMCChains functions using getfield (safer when conditionally loaded)
+    # Access MCMCChains functions using getfield
     Chains = getfield(Main, :MCMCChains).Chains
 
     θ_samples = results.theta # Samples are (n_samples × n_params_ode)
     n_samples, n_params_ode = size(θ_samples)
 
+    # Determine number of dimensions (needed for sigma)
+    n_dims = size(results.sigma, 2)
+
     # --- Assemble Parameter Names ---
+    _par_names_vec = String[]
     # Start with θ names
     if par_names === nothing
-        # Default names: theta[1], theta[2], ... <<<--- FIX: Use ASCII
-        _par_names_vec = ["theta[$i]" for i in 1:n_params_ode]
+        θ_names = ["theta[$i]" for i in 1:n_params_ode]
     else
-        # Use provided names, checking length only for θ part
         if length(par_names) != n_params_ode
             error("Length of provided par_names ($(length(par_names))) does not match number of θ parameters ($n_params_ode).")
         end
-        _par_names_vec = copy(par_names) # Use a copy
+        θ_names = copy(par_names)
     end
+    append!(_par_names_vec, θ_names)
 
-    # --- Assemble Data Matrix ---
-    # Start with θ samples
-    data_matrix = θ_samples # (n_samples × n_params_ode)
-
-    # Add σ samples if requested
+    # Add σ names if requested
     if include_sigma
-        σ_values = vec(results.sigma) # σ is usually fixed/estimated once (1 × n_dims)
-        n_dims = length(σ_values)
-        # Repeat the single σ vector for all samples
-        σ_matrix = repeat(reshape(σ_values, 1, n_dims), n_samples, 1) # (n_samples × n_dims)
-        data_matrix = hcat(data_matrix, σ_matrix)
-        # Add σ names <<<--- FIX: Use ASCII
         σ_names = ["sigma[$i]" for i in 1:n_dims]
         append!(_par_names_vec, σ_names)
     end
 
-    # Add log-posterior (lp) samples if requested and available
+    # Add lp name if requested
     if include_lp && haskey(results, :lp) && !isempty(results.lp)
-        lp_samples = results.lp
-        if length(lp_samples) == n_samples
-            # Add lp as the last column
-            data_matrix = hcat(data_matrix, lp_samples)
-            # Add lp name
+        if length(results.lp) == n_samples
             push!(_par_names_vec, "lp")
-        else
-            @warn "Length of log-posterior (:lp) samples ($(length(lp_samples))) does not match number of θ samples ($n_samples). Cannot include lp in chain."
         end
-    elseif include_lp
-         @warn "Log-posterior (:lp) key not found or vector is empty in results. Cannot include lp in chain."
+        # Warning for length mismatch is handled below
     end
+
+    # --- Assemble Data Matrix ---
+    data_matrices = Any[θ_samples] # Start with theta samples
+
+    # Add σ samples if requested
+    if include_sigma
+        sigma_data = results.sigma
+        if size(sigma_data, 1) != n_samples
+             @warn "Sigma data in results has incorrect number of rows ($(size(sigma_data, 1)) vs $n_samples). Cannot include sigma reliably."
+             # Remove sigma names if data is bad
+             _par_names_vec = filter(x -> !startswith(x, "sigma["), _par_names_vec)
+        else
+            push!(data_matrices, sigma_data) # Append sigma samples/values
+        end
+    end
+
+    # Add log-posterior (lp) samples if requested and available
+    lp_added = false
+    if include_lp
+        if haskey(results, :lp) && !isempty(results.lp)
+            lp_samples = results.lp
+            if length(lp_samples) == n_samples
+                # Reshape lp to be a column vector for hcat
+                push!(data_matrices, reshape(lp_samples, n_samples, 1))
+                lp_added = true
+            else
+                @warn "Length of log-posterior (:lp) samples ($(length(lp_samples))) does not match number of θ samples ($n_samples). Cannot include lp in chain."
+                # Remove lp name if data is bad
+                _par_names_vec = filter(x -> x != "lp", _par_names_vec)
+            end
+        else
+             @warn "Log-posterior (:lp) key not found or vector is empty in results. Cannot include lp in chain."
+             # Remove lp name if requested but not found
+             _par_names_vec = filter(x -> x != "lp", _par_names_vec)
+        end
+    end
+
+    # Concatenate selected data matrices horizontally
+    data_matrix = hcat(data_matrices...)
+
+    # Verify dimensions match names
+    if size(data_matrix, 2) != length(_par_names_vec)
+        @error "Mismatch between data matrix columns ($(size(data_matrix, 2))) and parameter names ($(length(_par_names_vec))). Check include_sigma/include_lp flags and results content."
+        # Attempt to proceed with available names/data, may lead to errors in MCMCChains
+        min_len = min(size(data_matrix, 2), length(_par_names_vec))
+        data_matrix = data_matrix[:, 1:min_len]
+        _par_names_vec = _par_names_vec[1:min_len]
+    end
+
 
     # Convert final list of string names to Symbols for MCMCChains
     _par_names_symbols = Symbol.(_par_names_vec)
@@ -659,61 +888,77 @@ function results_to_chain(results::NamedTuple; par_names=nothing, include_sigma=
     # MCMCChains expects data in [iterations, parameters, chains]
     # Assuming a single chain from our sampler run
     chains_data = reshape(data_matrix, n_samples, size(data_matrix, 2), 1)
+
+    # Check for NaNs or Infs in data before creating chain
+    if !all(isfinite, chains_data)
+        @warn "Non-finite values detected in data passed to MCMCChains. Summary/plotting might fail."
+        # Optionally replace non-finite values
+        # chains_data[.!isfinite.(chains_data)] .= NaN # Or some other placeholder
+    end
+
     chn = Chains(chains_data, _par_names_symbols) # Use Symbols for names
 
     return chn
 end
 
-# ... (magi_summary function) ...
+
 """
     magi_summary(results::NamedTuple; par_names=nothing, include_sigma=false, digits=3, lower=0.025, upper=0.975)
 
-Compute and print summary statistics (mean, median, quantiles, standard deviation, etc.)
-for the MCMC samples of θ (and optionally σ).
-
-Requires the `MCMCChains` package to be loaded for a full summary table.
-Falls back to basic mean/median if `MCMCChains` is not available.
+Compute and print summary statistics for MCMC samples.
+Requires `MCMCChains`. Falls back to basic stats if unavailable.
 
 # Arguments
-- `results::NamedTuple`: The output from `solve_magi`.
-- `par_names::Union{Vector{String}, Nothing}`: Optional names for the θ parameters.
-- `include_sigma::Bool`: If true, include σ in the summary. Default: `false`.
-- `digits::Int`: Number of significant digits to display. Default: 3.
-- `lower::Float64`: Lower quantile for the credible interval. Default: 0.025.
-- `upper::Float64`: Upper quantile for the credible interval. Default: 0.975.
+- `results::NamedTuple`: Output from `solve_magi`.
+- `par_names::Union{Vector{String}, Nothing}`: Optional names for θ parameters.
+- `include_sigma::Bool`: Include σ samples in the summary. Default: `false`.
+- `digits::Int`: Significant digits for display. Default: 3.
+- `lower::Float64`, `upper::Float64`: Quantiles for credible interval. Defaults: 0.025, 0.975.
 
 # Returns
-- `NamedTuple` containing `summarystats` and `quantiles` DataFrames (if `MCMCChains` is loaded).
-- `nothing` otherwise.
+- `NamedTuple` containing `summarystats` and `quantiles` DataFrames (if `MCMCChains` is loaded), otherwise `nothing`.
 """
 function magi_summary(results::NamedTuple; par_names=nothing, include_sigma=false, digits=3, lower=0.025, upper=0.975)
     println("--- MAGI Posterior Summary ---")
 
+    # Basic fallback stats calculation function
+    function print_basic_stats(label, samples, digits)
+        if isempty(samples)
+            println("$label: No samples available.")
+            return
+        end
+        means = mean(samples, dims=1)
+        medians = median(samples, dims=1)
+        println("$label Mean:   ", round.(vec(means); digits=digits))
+        println("$label Median: ", round.(vec(medians); digits=digits))
+    end
+
     if !@isloaded(MCMCChains)
         # Fallback if MCMCChains is not loaded
         @warn "MCMCChains not available. Printing basic mean/median."
-        θ_mean = mean(results.theta, dims=1)
-        θ_median = median(results.theta, dims=1)
-        println("Theta (θ) Mean:   ", round.(vec(θ_mean); digits=digits))
-        println("Theta (θ) Median: ", round.(vec(θ_median); digits=digits))
+        print_basic_stats("Theta (θ)", results.theta, digits)
         if include_sigma
-             println("Sigma (σ) Used:   ", round.(vec(results.sigma); digits=digits))
+            # Check if sigma was sampled or fixed
+            if size(results.sigma, 1) > 1
+                print_basic_stats("Sigma (σ)", results.sigma, digits)
+            else
+                println("Sigma (σ) Fixed: ", round.(vec(results.sigma); digits=digits))
+            end
         end
         return nothing
     end
 
     # Use MCMCChains for a comprehensive summary
-    # Access MCMCChains functions using getfield
     summarystats_func = getfield(Main, :MCMCChains).summarystats
     quantile_func = getfield(Main, :MCMCChains).quantile
 
     try
-        # Create chain including sigma if requested (lp is included for potential diagnostics)
+        # Create chain including sigma/lp if requested
         chain = results_to_chain(results; par_names=par_names, include_sigma=include_sigma, include_lp=true)
 
-        # Calculate summary stats and quantiles using MCMCChains functions
+        # Calculate summary stats and quantiles
         stats = summarystats_func(chain)
-        quants = quantile_func(chain; q=[lower, 0.5, upper]) # Get lower, median, upper quantiles
+        quants = quantile_func(chain; q=[lower, 0.5, upper])
 
         # Print nicely formatted summary tables
         println(stats)
@@ -725,19 +970,19 @@ function magi_summary(results::NamedTuple; par_names=nothing, include_sigma=fals
     catch e
         @error "Error generating MCMCChains summary:" exception=(e, catch_backtrace())
         println("Falling back to basic mean/median calculation.")
-        # Duplicate fallback logic in case of error during MCMCChains processing
-        θ_mean = mean(results.theta, dims=1)
-        θ_median = median(results.theta, dims=1)
-        println("Theta (θ) Mean:   ", round.(vec(θ_mean); digits=digits))
-        println("Theta (θ) Median: ", round.(vec(θ_median); digits=digits))
+        # Duplicate fallback logic
+        print_basic_stats("Theta (θ)", results.theta, digits)
         if include_sigma
-             println("Sigma (σ) Used:   ", round.(vec(results.sigma); digits=digits))
+            if size(results.sigma, 1) > 1
+                print_basic_stats("Sigma (σ)", results.sigma, digits)
+            else
+                println("Sigma (σ) Fixed: ", round.(vec(results.sigma); digits=digits))
+            end
         end
          return nothing
     end
 end
 
-# ... (plot_magi function) ...
 """
     plot_magi(
         results::NamedTuple;
@@ -746,29 +991,23 @@ end
         include_sigma=false, include_lp=true, nplotcol=3, kwargs...
     )
 
-Generate plots from `solve_magi` results. Requires `Plots` and `StatsPlots` packages.
-
-Two plot types are supported:
-- `type="traj"` (default): Plots the inferred mean trajectories x(t) with credible intervals,
-  optionally overlaying the original observations y(τ).
-- `type="trace"`: Generates MCMC trace plots for θ (and optionally σ, lp) using `MCMCChains.jl`.
+Generate plots from `solve_magi` results. Requires `Plots` and `StatsPlots`.
 
 # Arguments
-- `results::NamedTuple`: The output from `solve_magi`.
-- `type::String`: Plot type, either "traj" or "trace". Default: "traj".
-- `par_names::Union{Vector{String}, Nothing}`: Names for θ parameters (for trace plot legends).
-- `comp_names::Union{Vector{String}, Nothing}`: Names for state components x_d (for trajectory plot titles).
-- `t_obs::Union{Vector{Float64}, Nothing}`: Time vector corresponding to `results.x_sampled` and `y_obs`. Usually the `t_obs` passed to `solve_magi`.
-- `y_obs::Union{Matrix{Float64}, Nothing}`: Observation matrix (n_times × n_dims) to overlay on trajectory plots. Usually the `y_obs` passed to `solve_magi`.
-- `obs::Bool`: If true, overlay observations on trajectory plots. Default: `true`.
-- `ci::Bool`: If true, show credible intervals/bands on plots. Default: `true`.
-- `ci_col`: Color for credible intervals. Default: `:skyblue`.
-- `lower::Float64`: Lower quantile for credible interval. Default: 0.025.
-- `upper::Float64`: Upper quantile for credible interval. Default: 0.975.
-- `include_sigma::Bool`: Include σ in trace plots. Default: `false`.
-- `include_lp::Bool`: Include log-posterior (lp) in trace plots. Default: `true`.
-- `nplotcol::Int`: Number of columns for subplot layout. Default: 3.
-- `kwargs...`: Additional keyword arguments passed to the underlying `Plots.plot` or `StatsPlots.plot` functions.
+- `results::NamedTuple`: Output from `solve_magi`.
+- `type::String`: "traj" or "trace". Default: "traj".
+- `par_names`: Names for θ parameters (for trace plot).
+- `comp_names`: Names for state components x_d (for trajectory plot).
+- `t_obs`: Time vector for x-axis.
+- `y_obs`: Observation matrix to overlay.
+- `obs::Bool`: Overlay observations? Default: `true`.
+- `ci::Bool`: Show credible intervals? Default: `true`.
+- `ci_col`: CI color. Default: `:skyblue`.
+- `lower`, `upper`: CI quantiles. Defaults: 0.025, 0.975.
+- `include_sigma`: Include σ in trace plots? Default: `false`.
+- `include_lp`: Include log-posterior (lp) in trace plots? Default: `true`.
+- `nplotcol`: Columns for subplot layout. Default: 3.
+- `kwargs...`: Additional keyword arguments passed to `Plots.plot` / `StatsPlots.plot`.
 
 # Returns
 - A `Plots.Plot` object.
@@ -798,24 +1037,27 @@ function plot_magi(results::NamedTuple;
     Plots = getfield(Main, :Plots)
     StatsPlots = getfield(Main, :StatsPlots)
 
+    # Get dimensions from results
+    n_samples, n_times, n_dims = size(results.x_sampled)
+
     if type == "traj"
         # --- Plot Inferred Trajectories ---
-        x_sampled = results.x_sampled # Samples are (n_samples × n_times × n_dims)
-        n_samples, n_times, n_dims = size(x_sampled)
+        x_sampled = results.x_sampled
 
         # Set component names
-        if comp_names === nothing
-            _comp_names = ["Component $i" for i in 1:n_dims]
+        _comp_names = if comp_names === nothing
+            ["Component $i" for i in 1:n_dims]
         else
             if length(comp_names) != n_dims
-                error("Length of comp_names ($(length(comp_names))) does not match number of dimensions ($n_dims).")
+                @warn "Length of comp_names ($(length(comp_names))) does not match number of dimensions ($n_dims). Using defaults."
+                ["Component $i" for i in 1:n_dims]
+            else
+                comp_names
             end
-            _comp_names = comp_names
         end
 
-        # Determine plot layout (rows, columns)
+        # Determine plot layout
         plot_layout = (Int(ceil(n_dims / nplotcol)), nplotcol)
-        # Create overall plot object
         plt = Plots.plot(layout=plot_layout, legend=false, titlefont=8; kwargs...)
 
         # Determine time vector for x-axis
@@ -826,78 +1068,78 @@ function plot_magi(results::NamedTuple;
         end
         xlab = t_obs === nothing ? "Index" : "Time"
 
-        # Plot each dimension in a subplot
+        # Plot each dimension
         for d in 1:n_dims
-            x_dim_samples = x_sampled[:, :, d] # Get samples for dimension d (n_samples × n_times)
+            x_dim_samples = view(x_sampled, :, :, d) # Use view
 
-            # Calculate posterior mean and quantiles for credible interval
-            x_mean = mean(x_dim_samples, dims=1) |> vec # Posterior mean trajectory
-            local x_lower, x_upper # Ensure scope
-            ci_enabled_dim = ci # Use local flag in case quantile calculation fails
+            # Calculate posterior mean and quantiles
+            x_mean = vec(mean(x_dim_samples, dims=1))
+            local x_lower, x_upper
+            ci_enabled_dim = ci
             try
-                # Calculate quantiles across samples for each time point
-                x_lower = mapslices(x -> quantile(x, lower), x_dim_samples, dims=1) |> vec
-                x_upper = mapslices(x -> quantile(x, upper), x_dim_samples, dims=1) |> vec
+                 # Ensure samples are finite for quantile calculation
+                 finite_samples = filter(isfinite, x_dim_samples)
+                 if size(finite_samples, 1) < 2 # Check if enough finite samples per time point
+                      error("Not enough finite samples for CI calculation in dim $d")
+                 end
+                 # Calculate quantiles using mapslices for efficiency
+                 x_lower = vec(mapslices(x -> quantile(filter(isfinite, x), lower), x_dim_samples, dims=1))
+                 x_upper = vec(mapslices(x -> quantile(filter(isfinite, x), upper), x_dim_samples, dims=1))
+                 # Check if quantiles are valid
+                 if any(!isfinite, x_lower) || any(!isfinite, x_upper)
+                      error("Non-finite quantiles calculated for dim $d")
+                 end
             catch e_quantile
-                @warn "Could not calculate quantiles for trajectory plot CI for dim $d. CI disabled for this dimension." exception=e_quantile
-                ci_enabled_dim = false # Disable CI for this dimension
-                x_lower = x_mean # Assign dummy values if CI fails
+                @warn "Could not calculate quantiles for trajectory plot CI for dim $d. CI disabled for this dimension." exception=(e_quantile, catch_backtrace())
+                ci_enabled_dim = false
+                x_lower = x_mean # Dummy values
                 x_upper = x_mean
             end
 
-            # Add subplot for this dimension
+            # Add subplot
             Plots.plot!(plt[d], plot_times, x_mean, linecolor=:blue, label="Mean",
                         xlabel=xlab, ylabel="Level", title=_comp_names[d])
 
-            # Add credible interval ribbon if enabled
+            # Add credible interval ribbon
             if ci_enabled_dim
-                Plots.plot!(plt[d], plot_times, x_upper, fillrange=x_lower, fillalpha=0.3, fillcolor=ci_col,
+                Plots.plot!(plt[d], plot_times, ribbon=(x_mean .- x_lower, x_upper .- x_mean),
+                            fillalpha=0.3, fillcolor=ci_col,
                             linealpha=0, label="$((upper-lower)*100)% CI")
-                # Optionally plot CI boundaries faintly
-                # Plots.plot!(plt[d], plot_times, x_lower, linecolor=ci_col, linestyle=:dash, linealpha=0.5, label="")
-                # Plots.plot!(plt[d], plot_times, x_upper, linecolor=ci_col, linestyle=:dash, linealpha=0.5, label="")
             end
 
-            # Overlay observations if requested and available
+            # Overlay observations
             if obs
                 if y_obs === nothing || t_obs === nothing
-                    @warn "Cannot plot observations for dimension $d because y_obs or t_obs was not provided to plot_magi."
+                    if d==1 @warn "Cannot plot observations because y_obs or t_obs was not provided to plot_magi." end # Warn only once
                 else
-                     # Check dimensions before plotting observations
                      try
-                         if size(y_obs) != (n_times, n_dims)
-                             @warn "Dimensions of y_obs ($(size(y_obs))) do not match trajectory dimensions ($n_times, $n_dims). Cannot plot observations for dim $d."
+                         if size(y_obs, 1) != n_times || size(y_obs, 2) != n_dims
+                            if d==1 @warn "Dimensions of y_obs ($(size(y_obs))) do not match results dimensions ($n_times, $n_dims). Cannot plot observations." end
                          else
-                            # Find finite observations for this dimension
-                            valid_idx = findall(!isnan, y_obs[:, d])
+                            valid_idx = findall(i -> !isnan(y_obs[i, d]), 1:n_times)
                             if !isempty(valid_idx)
                                 Plots.scatter!(plt[d], t_obs[valid_idx], y_obs[valid_idx, d],
                                                markercolor=:red, markersize=3, markerstrokewidth=0, label="Obs")
                             end
                          end
                      catch e_obs
-                          @error "Error plotting observations for dimension $d." exception=e_obs
+                         if d==1 @error "Error plotting observations." exception=e_obs end
                      end
                 end
             end
         end # end loop over dimensions
+        # Adjust layout to make space for a legend if needed
+        plot!(plt, legend = :outertopright) # Example legend position
         return plt
 
     elseif type == "trace"
         # --- Plot MCMC Traces ---
-         if !@isloaded(MCMCChains)
-             error("MCMCChains package is required for trace plots. Please install and load it (`using MCMCChains`).")
+         if !@isloaded(MCMCChains) || !@isloaded(StatsPlots)
+             error("MCMCChains and StatsPlots packages are required for trace plots.")
          end
 
         try
-            # Validate parameter names length if provided
-            n_params_ode = size(results.theta, 2)
-            if par_names !== nothing && length(par_names) != n_params_ode
-                @warn "Length of provided par_names ($(length(par_names))) does not match number of θ parameters ($n_params_ode). Using default names θ[i]."
-                par_names = nothing # Use default names generated by results_to_chain
-            end
-
-            # Convert results to MCMCChains object
+            # Create chain object using the updated results_to_chain
             chain = results_to_chain(results; par_names=par_names, include_sigma=include_sigma, include_lp=include_lp)
 
             # Use StatsPlots.plot on the Chains object

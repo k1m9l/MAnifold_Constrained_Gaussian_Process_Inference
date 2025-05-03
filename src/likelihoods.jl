@@ -55,8 +55,8 @@ function log_likelihood_and_gradient_banded(
     n_times, n_dims = size(xlatent)
     n_params = length(theta)
     ll = zero(T) # Initialize log-likelihood
-    # Ensure gradient vector matches total number of parameters (xlatent + theta)
-    total_grad_elements = n_times * n_dims + n_params
+    # Resize gradient vector (now includes space for sigma gradients)
+    total_grad_elements = n_times * n_dims + n_params + n_dims # <-- Added n_dims
     grad = zeros(T, total_grad_elements)
 
     # --- Argument Checks ---
@@ -153,11 +153,13 @@ function log_likelihood_and_gradient_banded(
 
     # --- Calculate Gradient ---
     grad_x = @view grad[1:(n_times * n_dims)]
-    grad_theta = @view grad[(n_times * n_dims + 1):end]
+    grad_theta = @view grad[(n_times * n_dims + 1):(n_times * n_dims + n_params)]
+    grad_sigma = @view grad[(n_times * n_dims + n_params + 1):end] # New view for sigma gradients
     grad_x_mat = reshape(grad_x, n_times, n_dims)
 
     grad_x_mat .= zero(T)
     grad_theta .= zero(T)
+    grad_sigma .= zero(T) # Initialize sigma gradients
 
     J_state_temp = zeros(T, n_dims, n_dims)
     J_param_temp = zeros(T, n_dims, n_params)
@@ -216,6 +218,30 @@ function log_likelihood_and_gradient_banded(
             # dL/dtheta_k contribution from dF_p/dtheta_k
             for k in 1:n_params
                  grad_theta[k] -= J_param_temp[pdim, k] * KFE_i_scaled
+            end
+        end
+
+        # --- NEW: Calculate Gradient w.r.t. sigma ---
+        # Contribution from Observation term to dL/dsigma_p
+        # dL/dsigma_p = (1/beta_3) * [ SSE_p / sigma_p^3 - Np / sigma_p ]
+        # where SSE_p = dot(fitLevelError[idx_finite], fitLevelError[idx_finite])
+        #       Np = sum(idx_finite)
+        if sigma[pdim] > 0 # Avoid division by zero
+            sse_p = zero(T)
+            np = 0
+            for i in 1:n_times
+                if idx_finite[i]
+                    sse_p += fitLevelError[i]^2
+                    np += 1
+                end
+            end
+
+            # Only calculate if there are observations for this dimension
+            if np > 0
+                # grad_L_p_wrt_sigma_p = (sse_p / sigma[pdim]^3 - np / sigma[pdim]) / prior_temperature[3]
+                # Simplified:
+                grad_L_p_wrt_sigma_p = (sse_p / sigma_sq[pdim] - np) / (sigma[pdim] * prior_temperature[3])
+                grad_sigma[pdim] += grad_L_p_wrt_sigma_p
             end
         end
     end
